@@ -1,7 +1,7 @@
 import collections
 import numpy as np
 import torch
-import ctc_segmentation
+import torchaudio
 
 TOKEN_EOS = {'。', '?', '!'}
 TOKEN_COMMA = {'、', ','}
@@ -58,18 +58,101 @@ def find_blank(model, samples, threshold=0.98):
     return max(blanks, key=lambda b: b.end - b.start)
 
 def get_timings(model, samples, text):
-    """Compute playback timing of each character using CTC segmentation"""
+    """Compute playback timing of each character.
+
+    Uses torchaudio forced_align to map text to audio frames.
+
+    Args:
+        model: The ReazonSpeech ESPnet model.
+        samples: The audio waveform array.
+        text: The transcribed text string.
+
+    Returns:
+        np.ndarray: Array of timings in audio samples for each character.
+    """
     lpz = ctc_decode(model, samples)
 
-    opt = ctc_segmentation.CtcSegmentationParameters(
-        index_duration = len(samples) / (lpz.shape[0] + 1),
-        char_list = model.asr_model.token_list[:-1]
-    )
-    matrix, indices = ctc_segmentation.prepare_text(opt, [text])
-    timings = ctc_segmentation.ctc_segmentation(opt, lpz, matrix)[0]
+    token_list = model.asr_model.token_list
+    blank_id = model.asr_model.blank_id
 
-    # "+1" to skip a preceding blank character.
-    return timings[indices[0]+1:indices[1]]
+    # 1. Map text characters to model token IDs using greedy matching.
+    # This handles single-character and multi-character (BPE) tokens
+    # safely, mimicking original ctc_segmentation.prepare_text behavior.
+    tokens = []
+    char_to_token_idx =[]
+    max_token_len = max(len(t) for t in token_list)
+
+    i = 0
+    while i < len(text):
+        match_found = False
+        for length in range(max_token_len, 0, -1):
+            if i + length <= len(text):
+                span = text[i:i+length]
+                if span in token_list:
+                    tokens.append(token_list.index(span))
+                    char_to_token_idx.append(i)
+                    i += length
+                    match_found = True
+                    break
+        if not match_found:
+            i += 1
+
+    if not tokens:
+        # Raise an error to trigger split_text's fallback mechanism
+        raise ValueError("No valid tokens found in the text.")
+
+
+    # 2. Prepare tensors for forced_align
+    # Use clamp to avoid -inf from log(0)
+    log_probs = torch.from_numpy(lpz).clamp(min=1e-7).log().unsqueeze(0)
+    targets = torch.tensor([tokens], dtype=torch.long)
+
+    in_lens = torch.tensor([log_probs.shape[1]], dtype=torch.long)
+    tgt_lens = torch.tensor([targets.shape[1]], dtype=torch.long)
+
+    # 3. Perform forced alignment natively
+    alignments, _ = torchaudio.functional.forced_align(
+        log_probs,
+        targets,
+        input_lengths=in_lens,
+        target_lengths=tgt_lens,
+        blank=blank_id
+    )
+
+    alignments = alignments[0].tolist() # Extract path of length T
+
+    # 4. Reconstruct character timings from the alignment path
+    timings = np.zeros(len(text))
+    target_idx = 0
+    prev_token_id = blank_id
+
+    for frame_idx, token_id in enumerate(alignments):
+        if target_idx < len(tokens):
+            expected = tokens[target_idx]
+
+            # New emission happens if we see the expected token AND
+            # it's the first time after a blank or different token.
+            if token_id == expected and prev_token_id != expected:
+                orig_char_idx = char_to_token_idx[target_idx]
+                timings[orig_char_idx] = frame_idx
+                target_idx += 1
+
+        prev_token_id = token_id
+
+    # 5. Forward-fill timings for skipped characters (e.g. punctuation)
+    char_to_token_set = set(char_to_token_idx)
+    for i in range(len(text)):
+        if i not in char_to_token_set:
+            if i > 0:
+                timings[i] = timings[i-1]
+            else:
+                timings[i] = 0
+
+    # 6. Convert timings from frame indices to audio samples
+    index_duration = len(samples) / (lpz.shape[0] + 1)
+    timings = timings * index_duration
+
+    return timings
 
 def find_end_of_segment(text, timings, start):
     nchar = len(text)
